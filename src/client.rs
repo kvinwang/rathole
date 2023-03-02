@@ -97,7 +97,7 @@ impl<T: 'static + Transport> Client<T> {
             // Create a control channel for each service defined
             let handle = ControlChannelHandle::new(
                 (*config).clone(),
-                self.config.remote_addr.clone(),
+                self.config.remote_addrs(),
                 self.transport.clone(),
                 self.config.heartbeat_timeout,
             );
@@ -139,7 +139,7 @@ impl<T: 'static + Transport> Client<T> {
                     let name = cfg.name.clone();
                     let handle = ControlChannelHandle::new(
                         cfg,
-                        self.config.remote_addr.clone(),
+                        self.config.remote_addrs(),
                         self.transport.clone(),
                         self.config.heartbeat_timeout,
                     );
@@ -377,7 +377,7 @@ struct ControlChannel<T: Transport> {
     digest: ServiceDigest,              // SHA256 of the service name
     service: ClientServiceConfig,       // `[client.services.foo]` config block
     shutdown_rx: oneshot::Receiver<u8>, // Receives the shutdown signal
-    remote_addr: String,                // `client.remote_addr`
+    remote_addrs: Vec<String>,          // `client.remote_addr`
     transport: Arc<T>,                  // Wrapper around the transport layer
     heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
 }
@@ -390,15 +390,29 @@ struct ControlChannelHandle {
 
 impl<T: 'static + Transport> ControlChannel<T> {
     #[instrument(skip_all)]
-    async fn run(&mut self) -> Result<()> {
-        let mut remote_addr = AddrMaybeCached::new(&self.remote_addr);
+    async fn robin_run(&mut self) -> Result<()> {
+        for addr in self.remote_addrs.clone() {
+            match self.run(&addr).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    error!("Failed to run control channel with {addr}: {e:?}");
+                    continue;
+                }
+            }
+        }
+        Err(anyhow!("All remote addrs failed"))
+    }
+
+    #[instrument(skip_all)]
+    async fn run(&mut self, addr: &str) -> Result<()> {
+        let mut remote_addr = AddrMaybeCached::new(addr);
         remote_addr.resolve().await?;
 
         let mut conn = self
             .transport
             .connect(&remote_addr)
             .await
-            .with_context(|| format!("Failed to connect to {}", &self.remote_addr))?;
+            .with_context(|| format!("Failed to connect to {}", addr))?;
         T::hint(&conn, SocketOpts::for_control_channel());
 
         // Send hello
@@ -486,7 +500,7 @@ impl ControlChannelHandle {
     #[instrument(name="handle", skip_all, fields(service = %service.name))]
     fn new<T: 'static + Transport>(
         service: ClientServiceConfig,
-        remote_addr: String,
+        remote_addrs: Vec<String>,
         transport: Arc<T>,
         heartbeat_timeout: u64,
     ) -> ControlChannelHandle {
@@ -501,7 +515,7 @@ impl ControlChannelHandle {
             digest,
             service,
             shutdown_rx,
-            remote_addr,
+            remote_addrs,
             transport,
             heartbeat_timeout,
         };
@@ -511,7 +525,7 @@ impl ControlChannelHandle {
                 let mut start = Instant::now();
 
                 while let Err(err) = s
-                    .run()
+                    .robin_run()
                     .await
                     .with_context(|| "Failed to run the control channel")
                 {

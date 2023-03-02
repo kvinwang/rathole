@@ -201,6 +201,7 @@ fn default_client_retry_interval() -> u64 {
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     pub remote_addr: String,
+    pub backup_remote_addr: Option<String>,
     pub default_token: Option<MaskedString>,
     pub services: HashMap<String, ClientServiceConfig>,
     #[serde(default)]
@@ -209,6 +210,16 @@ pub struct ClientConfig {
     pub heartbeat_timeout: u64,
     #[serde(default = "default_client_retry_interval")]
     pub retry_interval: u64,
+}
+
+impl ClientConfig {
+    pub fn remote_addrs(&self) -> Vec<String> {
+        let mut addrs = vec![self.remote_addr.clone()];
+        if let Some(backup_remote_addr) = &self.backup_remote_addr {
+            addrs.push(backup_remote_addr.clone());
+        }
+        addrs
+    }
 }
 
 fn default_heartbeat_interval() -> u64 {

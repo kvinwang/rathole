@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, ToSocketAddrs};
-use tracing::{error, trace};
+use tracing::{error, info, trace};
 
 pub const DEFAULT_NODELAY: bool = true;
 
@@ -20,6 +20,16 @@ pub struct AddrMaybeCached {
     pub socket_addr: Option<SocketAddr>,
 }
 
+async fn fetch(url: &str) -> Option<String> {
+    reqwest::get(url)
+        .await
+        .ok()?
+        .bytes()
+        .await
+        .ok()
+        .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+}
+
 impl AddrMaybeCached {
     pub fn new(addr: &str) -> AddrMaybeCached {
         AddrMaybeCached {
@@ -29,7 +39,18 @@ impl AddrMaybeCached {
     }
 
     pub async fn resolve(&mut self) -> Result<()> {
-        match to_socket_addr(&self.addr).await {
+        let is_url = self.addr.starts_with("http://") || self.addr.starts_with("https://");
+        let addr = if is_url {
+            info!("Resolving address from URL: {}", self.addr);
+            fetch(&self.addr).await.unwrap_or_default()
+        } else {
+            self.addr.clone()
+        };
+        if addr.is_empty() {
+            anyhow::bail!("empty address");
+        }
+        info!("Server address: '{}'", addr);
+        match to_socket_addr(&addr).await {
             Ok(s) => {
                 self.socket_addr = Some(s);
                 Ok(())

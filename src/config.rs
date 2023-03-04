@@ -1,7 +1,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
+use std::net::IpAddr;
 use std::ops::Deref;
 use std::path::Path;
 use tokio::fs;
@@ -110,6 +111,42 @@ pub struct ServerServiceConfig {
     pub bind_addr: String,
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
+    pub whitelist: Option<IpList>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IpList {
+    list: HashSet<IpAddr>,
+}
+
+impl Serialize for IpList {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let ips: Vec<String> = self.list.iter().map(|ip| ip.to_string()).collect();
+        ips.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for IpList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let ips: Vec<String> = Vec::deserialize(deserializer)?;
+        let list = ips
+            .into_iter()
+            .map(|ip| ip.parse().map_err(|err| serde::de::Error::custom(err)))
+            .collect::<Result<HashSet<IpAddr>, _>>()?;
+        Ok(IpList { list })
+    }
+}
+
+impl IpList {
+    pub fn contains(&self, ip: &IpAddr) -> bool {
+        self.list.contains(ip)
+    }
 }
 
 impl ServerServiceConfig {

@@ -15,6 +15,7 @@ use backoff::ExponentialBackoff;
 
 use rand::RngCore;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
@@ -177,7 +178,7 @@ impl<T: 'static + Transport> Server<T> {
                                             let control_channels = self.control_channels.clone();
                                             let server_config = self.config.clone();
                                             tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config).await {
+                                                if let Err(err) = handle_connection(conn, addr, services, control_channels, server_config).await {
                                                     error!("{:#}", err);
                                                 }
                                             }.instrument(info_span!("connection", %addr)));
@@ -238,6 +239,7 @@ impl<T: 'static + Transport> Server<T> {
 // Handle connections to `server.bind_addr`
 async fn handle_connection<T: 'static + Transport>(
     mut conn: T::Stream,
+    addr: SocketAddr,
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     server_config: Arc<ServerConfig>,
@@ -256,7 +258,7 @@ async fn handle_connection<T: 'static + Transport>(
             .await?;
         }
         DataChannelHello(_, nonce) => {
-            do_data_channel_handshake(conn, control_channels, nonce).await?;
+            do_data_channel_handshake(conn, addr, control_channels, nonce).await?;
         }
     }
     Ok(())
@@ -349,6 +351,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
 
 async fn do_data_channel_handshake<T: 'static + Transport>(
     conn: T::Stream,
+    addr: SocketAddr,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     nonce: Nonce,
 ) -> Result<()> {
@@ -359,6 +362,11 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
     match control_channels_guard.get2(&nonce) {
         Some(handle) => {
             T::hint(&conn, SocketOpts::from_server_cfg(&handle.service));
+            if let Some(blacklist) = &handle.service.whitelist {
+                if !blacklist.contains(&addr.ip()) {
+                    anyhow::bail!("Data channel from {} is not in the whitelist", addr);
+                }
+            }
 
             // Send the data channel to the corresponding control channel
             handle

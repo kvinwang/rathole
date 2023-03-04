@@ -1,4 +1,6 @@
-use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
+use crate::config::{
+    Config, IpList, ServerConfig, ServerServiceConfig, ServiceType, TransportType,
+};
 use crate::config_watcher::{ConfigChange, ServerServiceChange};
 use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
 use crate::helper::retry_notify_with_deadline;
@@ -15,7 +17,6 @@ use backoff::ExponentialBackoff;
 
 use rand::RngCore;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
@@ -178,7 +179,7 @@ impl<T: 'static + Transport> Server<T> {
                                             let control_channels = self.control_channels.clone();
                                             let server_config = self.config.clone();
                                             tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, addr, services, control_channels, server_config).await {
+                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config).await {
                                                     error!("{:#}", err);
                                                 }
                                             }.instrument(info_span!("connection", %addr)));
@@ -239,7 +240,6 @@ impl<T: 'static + Transport> Server<T> {
 // Handle connections to `server.bind_addr`
 async fn handle_connection<T: 'static + Transport>(
     mut conn: T::Stream,
-    addr: SocketAddr,
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     server_config: Arc<ServerConfig>,
@@ -258,7 +258,7 @@ async fn handle_connection<T: 'static + Transport>(
             .await?;
         }
         DataChannelHello(_, nonce) => {
-            do_data_channel_handshake(conn, addr, control_channels, nonce).await?;
+            do_data_channel_handshake(conn, control_channels, nonce).await?;
         }
     }
     Ok(())
@@ -351,7 +351,6 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
 
 async fn do_data_channel_handshake<T: 'static + Transport>(
     conn: T::Stream,
-    addr: SocketAddr,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     nonce: Nonce,
 ) -> Result<()> {
@@ -362,12 +361,6 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
     match control_channels_guard.get2(&nonce) {
         Some(handle) => {
             T::hint(&conn, SocketOpts::from_server_cfg(&handle.service));
-            if let Some(blacklist) = &handle.service.whitelist {
-                if !blacklist.contains(&addr.ip()) {
-                    anyhow::bail!("Data channel from {} is not in the whitelist", addr);
-                }
-            }
-
             // Send the data channel to the corresponding control channel
             handle
                 .data_ch_tx
@@ -424,6 +417,7 @@ where
 
         let shutdown_rx_clone = shutdown_tx.subscribe();
         let bind_addr = service.bind_addr.clone();
+        let whitelist = service.whitelist.clone();
         match service.service_type {
             ServiceType::Tcp => tokio::spawn(
                 async move {
@@ -432,6 +426,7 @@ where
                         data_ch_rx,
                         data_ch_req_tx,
                         shutdown_rx_clone,
+                        whitelist,
                     )
                     .await
                     .with_context(|| "Failed to run TCP connection pool")
@@ -550,6 +545,7 @@ fn tcp_listen_and_send(
     addr: String,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
+    whitelist: Option<IpList>,
 ) -> mpsc::Receiver<TcpStream> {
     let (tx, rx) = mpsc::channel(CHAN_SIZE);
 
@@ -596,6 +592,12 @@ fn tcp_listen_and_send(
                             }
                         }
                         Ok((incoming, addr)) => {
+                            if let Some(whitelist) = &whitelist {
+                                if !whitelist.contains(&addr.ip()) {
+                                    warn!("Visitor {} is not in the whitelist. Ignoring...", addr);
+                                    continue;
+                                }
+                            }
                             // For every visitor, request to create a data channel
                             if data_ch_req_tx.send(true).with_context(|| "Failed to send data chan create request").is_err() {
                                 // An error indicates the control channel is broken
@@ -630,8 +632,10 @@ async fn run_tcp_connection_pool<T: Transport>(
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     shutdown_rx: broadcast::Receiver<bool>,
+    whitelist: Option<IpList>,
 ) -> Result<()> {
-    let mut visitor_rx = tcp_listen_and_send(bind_addr, data_ch_req_tx.clone(), shutdown_rx);
+    let mut visitor_rx =
+        tcp_listen_and_send(bind_addr, data_ch_req_tx.clone(), shutdown_rx, whitelist);
     let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
 
     'pool: while let Some(mut visitor) = visitor_rx.recv().await {
